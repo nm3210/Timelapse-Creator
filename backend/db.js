@@ -44,7 +44,8 @@ class DatabaseManager {
           'video_file',     -- File-based video sources
           'upload',         -- Uploaded photos
           'import',         -- Imported photos
-          'mqtt'            -- MQTT-triggered capture (legacy)
+          'mqtt',           -- MQTT-triggered capture (legacy)
+          'frigate_scraper' -- Frigate historical scraper
         )),
         source_config TEXT, -- JSON string for source-specific settings
         rtsp_url TEXT,      -- Legacy field, kept for backward compatibility
@@ -108,16 +109,106 @@ class DatabaseManager {
       this.migrateToV1();
     }
     
+    if (currentVersion < 2) {
+      this.migrateToV2();
+    }
+    
     // Update version
     this.db.prepare(`
       INSERT OR REPLACE INTO settings (key, value) 
       VALUES ('db_version', ?)
-    `).run('1');
+    `).run('2');
   }
 
   migrateToV1() {
     // Initial migration - schema is already created
     console.log('Database migrated to version 1');
+  }
+
+  migrateToV2() {
+    // Migration to add frigate_scraper to source_type CHECK constraint
+    // SQLite doesn't support ALTER TABLE to modify CHECK constraints directly,
+    // so we need to recreate the table with the new schema
+    console.log('Running migration to add frigate_scraper support...');
+    
+    try {
+      // Check if the sessions table already has frigate_scraper in the constraint
+      const tableInfo = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'").get();
+      
+      if (tableInfo && tableInfo.sql && tableInfo.sql.includes('frigate_scraper')) {
+        console.log('frigate_scraper already exists in CHECK constraint, skipping migration');
+        return;
+      }
+
+      // Begin transaction
+      this.db.exec('BEGIN TRANSACTION');
+
+      // Create new sessions table with updated CHECK constraint
+      this.db.exec(`
+        CREATE TABLE sessions_new (
+          id TEXT PRIMARY KEY,
+          source_type TEXT NOT NULL DEFAULT 'rtsp' CHECK (source_type IN (
+            'rtsp',
+            'usb_camera',
+            'capture_card',
+            'http_stream',
+            'rtmp_stream',
+            'screen_capture',
+            'video_file',
+            'upload',
+            'import',
+            'mqtt',
+            'frigate_scraper'
+          )),
+          source_config TEXT,
+          rtsp_url TEXT,
+          interval_seconds INTEGER NOT NULL,
+          duration_seconds INTEGER,
+          use_timer BOOLEAN DEFAULT 0,
+          active BOOLEAN DEFAULT 1,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          started_at DATETIME,
+          completed_at DATETIME,
+          retention_days INTEGER DEFAULT 7
+        )
+      `);
+
+      // Copy data from old table to new table
+      this.db.exec(`
+        INSERT INTO sessions_new (id, source_type, source_config, rtsp_url, interval_seconds, 
+                                  duration_seconds, use_timer, active, created_at, started_at, 
+                                  completed_at, retention_days)
+        SELECT id, source_type, source_config, rtsp_url, interval_seconds,
+               duration_seconds, use_timer, active, created_at, started_at,
+               completed_at, retention_days
+        FROM sessions
+      `);
+
+      // Drop old table
+      this.db.exec('DROP TABLE sessions');
+
+      // Rename new table to original name
+      this.db.exec('ALTER TABLE sessions_new RENAME TO sessions');
+
+      // Recreate indexes
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_snapshots_session_id ON snapshots(session_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_captured_at ON snapshots(captured_at);
+        CREATE INDEX IF NOT EXISTS idx_videos_session_id ON videos(session_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(active);
+        CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at);
+      `);
+
+      // Commit transaction
+      this.db.exec('COMMIT');
+      
+      console.log('Database migrated to version 2 (added frigate_scraper support)');
+    } catch (error) {
+      // Rollback on error
+      this.db.exec('ROLLBACK');
+      console.error('Migration to version 2 failed:', error.message);
+      throw error;
+    }
   }
 
   // Session management

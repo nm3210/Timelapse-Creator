@@ -16,6 +16,7 @@ Transform camera streams, uploaded photos, and MQTT-triggered captures into time
 - **Photo Upload** - Drag-and-drop interface for uploading image collections
 - **Network Import** - Import photos from network paths and shared folders
 - **MQTT Triggers** - Capture photos from any source based on MQTT message transitions (1→0)
+- **Frigate Historical Scraper** - Fetch frames from Frigate NVR history at precise intervals and stitch into timelapses
 
 ### 🎛️ **Advanced Management**
 - **Database Integration** - SQLite database for session tracking and metadata storage
@@ -119,6 +120,47 @@ The application provides multiple ways to create timelapses:
 5. **Start MQTT capture** to listen for messages
 6. **Photos are captured** from your selected source when message changes from '1' to '0'
 7. **Perfect for motion sensors, door triggers, etc.**
+
+### 🗄️ **Frigate Historical Scraper**
+The Frigate Historical Scraper allows you to create timelapses from your Frigate NVR's historical recordings at precise intervals, perfect for compressing long time periods into short videos.
+
+1. **Prerequisites:**
+   - Frigate must be running and accessible
+   - Set `FRIGATE_API_URL` environment variable (defaults to `http://frigate:5000`)
+
+2. **Using the Historical Scraper:**
+   - Switch to "Frigate Scraper" tab
+   - Enter your Frigate API URL (or leave empty to use the default from environment)
+   - Click "Load Cameras" to fetch available cameras from your Frigate instance
+   - Select a camera from the dropdown
+   - Configure the time range:
+     - **Start Date & Time** - When to begin fetching frames
+     - **End Date & Time** - When to stop fetching frames
+   - Set the **Interval** (seconds) - How often to fetch frames (e.g., every 30 seconds)
+   - Choose your **Timezone** for accurate time calculations
+   - Click "Calculate Preview" to see estimated frame count and video duration
+   - Click "Start Scraping" to begin fetching frames
+   - Watch real-time progress in the status display
+   - Video generation triggers automatically when scraping completes
+
+3. **Features:**
+   - **Timezone-aware calculations** using Luxon for accurate frame timing
+   - **Preview calculations** before starting the job
+   - **Real-time progress updates** via WebSocket
+   - **Automatic video generation** after scraping completes
+   - **Graceful error handling** - continues even if individual frames fail to download
+
+4. **Example Use Cases:**
+   - **Construction project** - 8 hours of recordings at 5-minute intervals → ~3 minute timelapse
+   - **Weather patterns** - 24 hours of sky footage at 10-second intervals → ~2 minute timelapse
+   - **Plant growth** - 1 week of recordings at 1-hour intervals → ~7 second timelapse
+
+5. **API Endpoints:**
+   - `POST /api/scraper/start` - Start historical scraping
+   - `POST /api/scraper/stop` - Stop active scraping
+   - `GET /api/scraper/status/:sessionId` - Get scraping status
+   - `GET /api/scraper/cameras?frigateApiUrl=<url>` - Fetch available cameras
+   - `POST /api/scraper/preview` - Calculate preview stats
 
 ### 🎥 **Frigate Integration**
 The application integrates with [Frigate](https://frigate.video/) to automatically discover and use cameras configured in your Frigate instance.
@@ -442,6 +484,13 @@ networks:
   - Returns list of cameras with names, RTSP URLs, and configuration details
   - If `apiUrl` is not provided, uses `FRIGATE_API_URL` environment variable
 
+### 🗄️ **Frigate Historical Scraper**
+- `POST /api/scraper/start` - Start historical scraping from Frigate recordings
+- `POST /api/scraper/stop` - Stop active scraping session
+- `GET /api/scraper/status/:sessionId` - Get scraping progress status
+- `GET /api/scraper/cameras?frigateApiUrl=<url>` - Fetch available cameras from Frigate
+- `POST /api/scraper/preview` - Calculate preview stats (frame count, duration)
+
 ### 🗄️ **Session Management**
 - `GET /api/sessions` - List all sessions with metadata
 - `DELETE /api/session/:id` - Delete session and all files
@@ -512,6 +561,7 @@ IMPORT_PARENT_PATH=/mnt/photo_import
 - [x] **Universal Video Input** - USB cameras, capture cards, HTTP/RTMP streams, screen capture
 - [x] **Multi-Source MQTT** - MQTT triggers work with all video source types
 - [x] **Multiple Output Formats** - MP4 and GIF support for maximum compatibility
+- [x] **Frigate Historical Scraper** - Timezone-aware historical frame fetching from Frigate NVR
 
 ### 🚀 **Future Enhancements**
 - [ ] **Additional Video Formats** - WebM, AVI support
@@ -538,6 +588,8 @@ This project relies on the following open source software:
 - [UUID](https://github.com/uuidjs/uuid) - MIT License
 - [WS](https://github.com/websockets/ws) - MIT License
 - [CORS](https://github.com/expressjs/cors) - MIT License
+- [Luxon](https://moment.github.io/luxon/) - MIT License
+- [Axios](https://axios-http.com/) - MIT License
 
 ### Frontend
 - [React](https://reactjs.org/) - MIT License

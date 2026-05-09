@@ -13,6 +13,7 @@ const archiver = require('archiver');
 const http = require('http');
 const https = require('https');
 const DatabaseManager = require('./db');
+const ScraperService = require('./scraperService');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -513,6 +514,9 @@ function broadcast(data) {
   });
 }
 
+// Initialize scraper service (must be after broadcast function is defined)
+const scraperService = new ScraperService(db, snapshotsDir, broadcast);
+
 // Helper function to replace localhost addresses in RTSP URLs
 function replaceRtspHost(rtspUrl) {
   if (!rtspUrl || !FRIGATE_RTSP_HOST) {
@@ -978,6 +982,191 @@ app.get('/api/session/:sessionId', (req, res) => {
     });
   } else {
     res.status(404).json({ success: false, message: 'Session not found' });
+  }
+});
+
+// Frigate Historical Scraper endpoints
+app.post('/api/scraper/start', async (req, res) => {
+  try {
+    const {
+      camera,
+      startIso,
+      endIso,
+      intervalSeconds,
+      frigateApiUrl,
+      timezone = 'America/New_York'
+    } = req.body;
+
+    // Validate required fields
+    if (!camera || !startIso || !endIso || !intervalSeconds) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: camera, startIso, endIso, intervalSeconds'
+      });
+    }
+
+    const sessionId = uuidv4();
+    const sessionDir = path.join(snapshotsDir, sessionId);
+    fs.mkdirSync(sessionDir, { recursive: true });
+
+    // Create session in database
+    const sessionData = {
+      id: sessionId,
+      source_type: 'frigate_scraper',
+      source_config: JSON.stringify({
+        camera,
+        startIso,
+        endIso,
+        intervalSeconds,
+        frigateApiUrl,
+        timezone
+      }),
+      rtsp_url: null,
+      interval_seconds: parseInt(intervalSeconds),
+      duration_seconds: null,
+      use_timer: false
+    };
+
+    db.createSession(sessionData);
+
+    // Start scraping in background
+    scraperService.runScrape({
+      sessionId,
+      camera,
+      startIso,
+      endIso,
+      intervalSeconds: parseInt(intervalSeconds),
+      frigateApiUrl,
+      timezone
+    }).catch(error => {
+      console.error(`Scrape failed for session ${sessionId}:`, error);
+      broadcast({
+        type: 'scrape_error',
+        sessionId,
+        error: error.message
+      });
+    });
+
+    res.json({
+      success: true,
+      sessionId,
+      message: 'Historical scrape started'
+    });
+
+  } catch (error) {
+    console.error('Error starting scraper:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to start scraper: ' + error.message
+    });
+  }
+});
+
+app.post('/api/scraper/stop', (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    
+    if (!sessionId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Session ID is required'
+      });
+    }
+
+    const stopped = scraperService.stopScrape(sessionId);
+    
+    if (stopped) {
+      res.json({
+        success: true,
+        message: 'Scrape stopped successfully'
+      });
+    } else {
+      res.status(404).json({
+        success: false,
+        message: 'Active scrape not found for this session'
+      });
+    }
+  } catch (error) {
+    console.error('Error stopping scraper:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to stop scraper: ' + error.message
+    });
+  }
+});
+
+app.get('/api/scraper/status/:sessionId', (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const status = scraperService.getScrapeStatus(sessionId);
+    
+    if (status) {
+      res.json({
+        success: true,
+        status
+      });
+    } else {
+      res.status(404).json({
+        success: false,
+        message: 'No active scrape found for this session'
+      });
+    }
+  } catch (error) {
+    console.error('Error getting scraper status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get scraper status: ' + error.message
+    });
+  }
+});
+
+app.get('/api/scraper/cameras', async (req, res) => {
+  try {
+    const { frigateApiUrl } = req.query;
+    
+    if (!frigateApiUrl) {
+      return res.status(400).json({
+        success: false,
+        message: 'frigateApiUrl query parameter is required'
+      });
+    }
+
+    const cameras = await scraperService.getFrigateCameras(frigateApiUrl);
+    res.json({
+      success: true,
+      cameras
+    });
+  } catch (error) {
+    console.error('Error fetching Frigate cameras:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch cameras: ' + error.message
+    });
+  }
+});
+
+app.post('/api/scraper/preview', (req, res) => {
+  try {
+    const { startIso, endIso, intervalSeconds } = req.body;
+    
+    if (!startIso || !endIso || !intervalSeconds) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: startIso, endIso, intervalSeconds'
+      });
+    }
+
+    const preview = scraperService.calculatePreview(startIso, endIso, parseInt(intervalSeconds));
+    res.json({
+      success: true,
+      preview
+    });
+  } catch (error) {
+    console.error('Error calculating preview:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to calculate preview: ' + error.message
+    });
   }
 });
 

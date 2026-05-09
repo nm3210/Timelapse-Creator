@@ -1,0 +1,291 @@
+const { DateTime } = require('luxon');
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const https = require('https');
+
+class ScraperService {
+  constructor(db, snapshotsDir, broadcastCallback) {
+    this.db = db;
+    this.snapshotsDir = snapshotsDir;
+    this.broadcast = broadcastCallback;
+    this.activeScrapes = new Map();
+  }
+
+  async runScrape(config) {
+    const {
+      sessionId,
+      camera,
+      startIso,
+      endIso,
+      intervalSeconds,
+      frigateApiUrl = process.env.FRIGATE_API_URL || 'http://frigate:5000',
+      timezone = 'America/New_York'
+    } = config;
+
+    console.log(`Starting scrape for session ${sessionId}, camera: ${camera}`);
+
+    const session = this.db.getSession(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    const sessionDir = path.join(this.snapshotsDir, sessionId);
+    if (!fs.existsSync(sessionDir)) {
+      fs.mkdirSync(sessionDir, { recursive: true });
+    }
+
+    const startTime = DateTime.fromISO(startIso, { zone: timezone });
+    const endTime = DateTime.fromISO(endIso, { zone: timezone });
+    
+    let frameCount = 0;
+    const scrapeState = {
+      active: true,
+      totalFrames: 0,
+      completedFrames: 0,
+      startTime: Date.now()
+    };
+
+    this.activeScrapes.set(sessionId, scrapeState);
+
+    try {
+      for (let currentTime = startTime; currentTime <= endTime; currentTime = currentTime.plus({ seconds: intervalSeconds })) {
+        if (!scrapeState.active) {
+          console.log(`Scrape for session ${sessionId} was stopped`);
+          break;
+        }
+
+        const timestamp = currentTime.toFormat('yyyy-MM-dd HH:mm:ss');
+        const frameNumber = String(frameCount + 1).padStart(4, '0');
+        const snapshotFile = path.join(sessionDir, `frame_${frameNumber}.jpg`);
+        
+        const snapshotUrl = `${frigateApiUrl}/api/${camera}/recordings/${encodeURIComponent(timestamp)}/snapshot.jpg`;
+        
+        try {
+          await this.downloadSnapshot(snapshotUrl, snapshotFile);
+          
+          const relativePath = `/snapshots/${sessionId}/frame_${frameNumber}.jpg`;
+          const stats = fs.statSync(snapshotFile);
+          
+          this.db.addSnapshot(sessionId, relativePath, {
+            file_size: stats.size,
+            captured_at: currentTime.toISO()
+          });
+
+          scrapeState.completedFrames++;
+          frameCount++;
+
+          this.broadcast({
+            type: 'snapshot',
+            sessionId: sessionId,
+            snapshot: relativePath,
+            count: frameCount,
+            scrape: true,
+            progress: {
+              completed: scrapeState.completedFrames,
+              total: scrapeState.totalFrames,
+              current: timestamp
+            }
+          });
+
+          console.log(`Captured frame ${frameNumber} for session ${sessionId} at ${timestamp}`);
+        } catch (error) {
+          console.error(`Failed to capture frame at ${timestamp}:`, error.message);
+          // Continue with next frame even if one fails
+        }
+      }
+
+      console.log(`Scrape completed for session ${sessionId}. Captured ${frameCount} frames.`);
+      
+      // Trigger video generation after scrape is complete
+      if (frameCount > 0) {
+        await this.triggerVideoGeneration(sessionId);
+      }
+
+      return {
+        success: true,
+        framesCaptured: frameCount,
+        sessionId: sessionId
+      };
+
+    } finally {
+      this.activeScrapes.delete(sessionId);
+      
+      // Mark session as completed
+      this.db.updateSession(sessionId, {
+        active: 0,
+        completed_at: new Date().toISOString()
+      });
+    }
+  }
+
+  async downloadSnapshot(url, outputPath) {
+    return new Promise((resolve, reject) => {
+      try {
+        const urlObj = new URL(url);
+        const client = urlObj.protocol === 'https:' ? https : http;
+        
+        const req = client.request(url, (res) => {
+          if (res.statusCode !== 200) {
+            reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+            return;
+          }
+
+          const fileStream = fs.createWriteStream(outputPath);
+          res.pipe(fileStream);
+
+          fileStream.on('finish', () => {
+            fileStream.close();
+            
+            // Verify file exists and has content
+            if (fs.existsSync(outputPath)) {
+              const stats = fs.statSync(outputPath);
+              if (stats.size > 0) {
+                resolve(outputPath);
+              } else {
+                fs.unlinkSync(outputPath);
+                reject(new Error('Downloaded file is empty'));
+              }
+            } else {
+              reject(new Error('Failed to create output file'));
+            }
+          });
+
+          fileStream.on('error', (error) => {
+            reject(error);
+          });
+        });
+
+        req.on('error', (error) => {
+          reject(error);
+        });
+
+        req.setTimeout(30000, () => {
+          req.destroy();
+          reject(new Error('Request timeout'));
+        });
+
+        req.end();
+      } catch (error) {
+        reject(new Error(`Invalid URL: ${error.message}`));
+      }
+    });
+  }
+
+  async triggerVideoGeneration(sessionId) {
+    console.log(`Triggering video generation for scraped session ${sessionId}`);
+    
+    // This will be handled by the existing video generation logic in server.js
+    // We just need to notify that scraping is complete
+    this.broadcast({
+      type: 'scrape_complete',
+      sessionId: sessionId,
+      message: 'Scraping completed, ready for video generation'
+    });
+  }
+
+  stopScrape(sessionId) {
+    const scrapeState = this.activeScrapes.get(sessionId);
+    if (scrapeState) {
+      scrapeState.active = false;
+      console.log(`Stopping scrape for session ${sessionId}`);
+      return true;
+    }
+    return false;
+  }
+
+  getScrapeStatus(sessionId) {
+    const scrapeState = this.activeScrapes.get(sessionId);
+    if (scrapeState) {
+      return {
+        active: scrapeState.active,
+        completedFrames: scrapeState.completedFrames,
+        totalFrames: scrapeState.totalFrames,
+        elapsedMs: Date.now() - scrapeState.startTime
+      };
+    }
+    return null;
+  }
+
+  async getFrigateCameras(apiUrl) {
+    return new Promise((resolve, reject) => {
+      try {
+        const url = new URL(`${apiUrl}/api/config`);
+        const isHttps = url.protocol === 'https:';
+        const client = isHttps ? https : http;
+        
+        const options = {
+          hostname: url.hostname,
+          port: url.port || (isHttps ? 443 : 80),
+          path: '/api/config',
+          method: 'GET'
+        };
+
+        const req = client.request(options, (res) => {
+          let data = '';
+
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
+
+          res.on('end', () => {
+            try {
+              if (res.statusCode !== 200) {
+                reject(new Error(`Frigate API returned status ${res.statusCode}`));
+                return;
+              }
+
+              const config = JSON.parse(data);
+              const cameras = [];
+
+              if (config.cameras) {
+                for (const [cameraName, cameraConfig] of Object.entries(config.cameras)) {
+                  if (cameraConfig.enabled !== false) {
+                    cameras.push({
+                      name: cameraName,
+                      displayName: cameraConfig.display_name || cameraName,
+                      enabled: cameraConfig.enabled !== false
+                    });
+                  }
+                }
+              }
+
+              resolve(cameras);
+            } catch (parseError) {
+              reject(new Error(`Failed to parse Frigate config: ${parseError.message}`));
+            }
+          });
+        });
+
+        req.on('error', (error) => {
+          reject(new Error(`Failed to connect to Frigate API: ${error.message}`));
+        });
+
+        req.setTimeout(10000, () => {
+          req.destroy();
+          reject(new Error('Frigate API request timeout'));
+        });
+
+        req.end();
+      } catch (error) {
+        reject(new Error(`Invalid Frigate API URL: ${error.message}`));
+      }
+    });
+  }
+
+  calculatePreview(startIso, endIso, intervalSeconds) {
+    const startTime = DateTime.fromISO(startIso);
+    const endTime = DateTime.fromISO(endIso);
+    const duration = endTime.diff(startTime, 'seconds').seconds;
+    const totalFrames = Math.ceil(duration / intervalSeconds);
+    const estimatedVideoDuration = totalFrames / 30; // Assuming 30 FPS for output
+
+    return {
+      totalFrames,
+      estimatedVideoDuration: Math.round(estimatedVideoDuration),
+      durationSeconds: Math.round(duration)
+    };
+  }
+}
+
+module.exports = ScraperService;
