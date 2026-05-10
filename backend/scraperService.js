@@ -10,6 +10,7 @@ class ScraperService {
     this.snapshotsDir = snapshotsDir;
     this.broadcast = broadcastCallback;
     this.activeScrapes = new Map();
+    this.completedScrapes = new Map(); // Keep last 10 completed/failed sessions
   }
 
   async runScrape(config) {
@@ -64,40 +65,61 @@ class ScraperService {
         const snapshotFile = path.join(sessionDir, `frame_${frameNumber}.jpg`);
 
         const snapshotUrl = `${frigateApiUrl}/api/${normalizedCamera}/recordings/${timestamp}/snapshot.jpg`;
-        
-        try {
-          await this.downloadSnapshot(snapshotUrl, snapshotFile);
 
-          const relativePath = `/snapshots/${sessionId}/frame_${frameNumber}.jpg`;
-          const stats = fs.statSync(snapshotFile);
+        // Try with fuzzy logic: original, +1s, +2s
+        let downloaded = false;
+        let usedTimestamp = timestamp;
 
-          this.db.addSnapshot(sessionId, relativePath, {
-            file_size: stats.size,
-            captured_at: currentTime.toISO()
-          });
+        for (const offset of [0, 1, 2]) {
+          const tryTimestamp = timestamp + offset;
+          const tryUrl = `${frigateApiUrl}/api/${normalizedCamera}/recordings/${tryTimestamp}/snapshot.jpg`;
 
-          scrapeState.completedFrames++;
-          frameCount++;
+          try {
+            await this.downloadSnapshot(tryUrl, snapshotFile);
 
-          this.broadcast({
-            type: 'snapshot',
-            sessionId: sessionId,
-            snapshot: relativePath,
-            count: frameCount,
-            scrape: true,
-            progress: {
-              completed: scrapeState.completedFrames,
-              total: scrapeState.totalFrames,
-              current: timestamp
+            const relativePath = `/snapshots/${sessionId}/frame_${frameNumber}.jpg`;
+            const stats = fs.statSync(snapshotFile);
+
+            this.db.addSnapshot(sessionId, relativePath, {
+              file_size: stats.size,
+              captured_at: currentTime.toISO()
+            });
+
+            scrapeState.completedFrames++;
+            frameCount++;
+
+            this.broadcast({
+              type: 'snapshot',
+              sessionId: sessionId,
+              snapshot: relativePath,
+              count: frameCount,
+              scrape: true,
+              progress: {
+                completed: scrapeState.completedFrames,
+                total: scrapeState.totalFrames,
+                current: timestamp
+              }
+            });
+
+            console.log(`Captured frame ${frameNumber} for session ${sessionId} at ${timestamp} (tried ${tryTimestamp})`);
+            downloaded = true;
+            usedTimestamp = tryTimestamp;
+            break;
+          } catch (error) {
+            if (offset === 0) {
+              console.error(`Failed to capture frame at ${timestamp}`);
+              console.error(`Failed URL: ${tryUrl}`);
+              console.error(`Error: ${error.message} - trying +1s`);
+            } else if (offset === 1) {
+              console.error(`Failed at ${tryTimestamp} - trying +2s`);
+            } else {
+              console.error(`Failed at ${tryTimestamp} - skipping frame`);
             }
-          });
+          }
+        }
 
-          console.log(`Captured frame ${frameNumber} for session ${sessionId} at ${timestamp}`);
-        } catch (error) {
-          console.error(`Failed to capture frame at ${timestamp}`);
-          console.error(`Failed URL: ${snapshotUrl}`);
-          console.error(`Error: ${error.message}`);
-          // Continue with next frame even if one fails
+        if (!downloaded) {
+          console.error(`Skipping frame ${frameNumber} for session ${sessionId} - all retries failed`);
         }
       }
 
@@ -115,8 +137,17 @@ class ScraperService {
       };
 
     } finally {
+      // Move to completed scrapes and keep last 10
+      this.completedScrapes.set(sessionId, { ...scrapeState, active: false, completedAt: Date.now() });
+
+      // Keep only last 10 completed sessions
+      if (this.completedScrapes.size > 10) {
+        const oldestKey = this.completedScrapes.keys().next().value;
+        this.completedScrapes.delete(oldestKey);
+      }
+
       this.activeScrapes.delete(sessionId);
-      
+
       // Mark session as completed
       this.db.updateSession(sessionId, {
         active: 0,
@@ -130,8 +161,13 @@ class ScraperService {
       try {
         const urlObj = new URL(url);
         const client = urlObj.protocol === 'https:' ? https : http;
-        
+
         const req = client.request(url, (res) => {
+          if (res.statusCode === 404 || res.statusCode === 422) {
+            reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
+            return;
+          }
+
           if (res.statusCode !== 200) {
             reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
             return;
@@ -142,7 +178,7 @@ class ScraperService {
 
           fileStream.on('finish', () => {
             fileStream.close();
-            
+
             // Verify file exists and has content
             if (fs.existsSync(outputPath)) {
               const stats = fs.statSync(outputPath);
@@ -180,7 +216,8 @@ class ScraperService {
 
   async triggerVideoGeneration(sessionId) {
     console.log(`Triggering video generation for scraped session ${sessionId}`);
-    
+    console.log(`FFmpeg video rendering will start shortly for session ${sessionId}...`);
+
     // This will be handled by the existing video generation logic in server.js
     // We just need to notify that scraping is complete
     this.broadcast({
@@ -201,7 +238,8 @@ class ScraperService {
   }
 
   getScrapeStatus(sessionId) {
-    const scrapeState = this.activeScrapes.get(sessionId);
+    // Check active scrapes first
+    let scrapeState = this.activeScrapes.get(sessionId);
     if (scrapeState) {
       return {
         active: scrapeState.active,
@@ -210,6 +248,18 @@ class ScraperService {
         elapsedMs: Date.now() - scrapeState.startTime
       };
     }
+
+    // Check completed scrapes (last 10)
+    scrapeState = this.completedScrapes.get(sessionId);
+    if (scrapeState) {
+      return {
+        active: false,
+        completedFrames: scrapeState.completedFrames,
+        totalFrames: scrapeState.totalFrames,
+        elapsedMs: scrapeState.completedAt - scrapeState.startTime
+      };
+    }
+
     return null;
   }
 
