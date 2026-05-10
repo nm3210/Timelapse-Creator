@@ -1244,7 +1244,7 @@ app.post('/api/generate-timelapse', (req, res) => {
 
   // Set input options based on session type
   if (isScraper) {
-    command.inputOptions(['-hwaccel qsv', '-c:v h264_qsv', '-r', fps.toString()]);
+    command.inputOptions(['-hwaccel qsv', '-qsv_device', '/dev/dri/renderD128', '-c:v h264_qsv', '-r', fps.toString()]);
   } else {
     command.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
   }
@@ -1273,7 +1273,7 @@ app.post('/api/generate-timelapse', (req, res) => {
 
       // Set input options based on session type
       if (isScraper) {
-        paletteCommand.inputOptions(['-hwaccel qsv', '-c:v h264_qsv', '-r', fps.toString()]);
+        paletteCommand.inputOptions(['-hwaccel qsv', '-qsv_device', '/dev/dri/renderD128', '-c:v h264_qsv', '-r', fps.toString()]);
       } else {
         paletteCommand.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
       }
@@ -1293,7 +1293,7 @@ app.post('/api/generate-timelapse', (req, res) => {
 
         // Set input options based on session type
         if (isScraper) {
-          finalCommand.inputOptions(['-hwaccel qsv', '-c:v h264_qsv', '-r', fps.toString()]);
+          finalCommand.inputOptions(['-hwaccel qsv', '-qsv_device', '/dev/dri/renderD128', '-c:v h264_qsv', '-r', fps.toString()]);
         } else {
           finalCommand.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
         }
@@ -1381,7 +1381,7 @@ app.post('/api/generate-timelapse', (req, res) => {
   } else {
     // MP4 output options
     const mp4OutputOptions = isScraper
-      ? ['-c:v', 'h264_qsv', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-cq', '23']
+      ? ['-c:v', 'h264_qsv', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-b:v', '5M']
       : ['-c:v', 'h264_nvenc', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-cq', '23'];
 
     // Add scale filter if specified
