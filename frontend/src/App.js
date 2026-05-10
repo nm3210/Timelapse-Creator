@@ -2546,12 +2546,30 @@ function App() {
                 {/* Status Display */}
                 {scraperStatus && (
                   <div className="bg-green-900/30 border border-green-700 rounded-lg p-4">
-                    <h3 className="text-white font-semibold mb-2">Scraping Status</h3>
+                    <h3 className="text-white font-semibold mb-2">
+                      {scraperStatus.active && !scraperStatus.completed
+                        ? `Capturing frame ${scraperStatus.progress_current || scraperStatus.completedFrames} of ${scraperStatus.progress_total || scraperStatus.totalFrames}...`
+                        : 'Scraping Status'}
+                    </h3>
                     <div className="text-sm text-gray-200 space-y-1">
                       <p><strong>Completed Frames:</strong> {scraperStatus.completedFrames}</p>
                       <p><strong>Elapsed:</strong> {Math.round(scraperStatus.elapsedMs / 1000)}s</p>
                       {scraperStatus.current && (
                         <p><strong>Current:</strong> {scraperStatus.current}</p>
+                      )}
+                      {/* Progress Bar */}
+                      {scraperStatus.progress_total > 0 && (
+                        <div className="mt-3">
+                          <div className="w-full bg-gray-700 rounded-full h-2.5">
+                            <div
+                              className="bg-green-500 h-2.5 rounded-full transition-all duration-300"
+                              style={{ width: `${((scraperStatus.progress_current || scraperStatus.completedFrames) / scraperStatus.progress_total) * 100}%` }}
+                            ></div>
+                          </div>
+                          <p className="text-xs text-gray-400 mt-1">
+                            {Math.round(((scraperStatus.progress_current || scraperStatus.completedFrames) / scraperStatus.progress_total) * 100)}% complete
+                          </p>
+                        </div>
                       )}
                     </div>
                   </div>

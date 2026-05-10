@@ -53,95 +53,131 @@ class ScraperService {
 
     this.activeScrapes.set(sessionId, scrapeState);
 
+    // Calculate all frame timestamps first
+    const framesToDownload = [];
+    for (let currentTime = startTime; currentTime <= endTime; currentTime = currentTime.plus({ seconds: intervalSeconds })) {
+      const timestamp = Math.floor(currentTime.toSeconds());
+      const frameNumber = String(frameCount + 1).padStart(4, '0');
+      framesToDownload.push({
+        frameNumber,
+        timestamp,
+        currentTime: currentTime.toISO()
+      });
+      frameCount++;
+    }
+
+    scrapeState.totalFrames = frameCount;
+
+    // Update database with total frames
+    this.db.updateSession(sessionId, {
+      progress_total: frameCount
+    });
+
+    console.log(`[Scraper] Starting parallel download of ${frameCount} frames with concurrency limit of 10`);
+
+    const CONCURRENCY_LIMIT = 10;
+    let completedCount = 0;
+
     try {
-      for (let currentTime = startTime; currentTime <= endTime; currentTime = currentTime.plus({ seconds: intervalSeconds })) {
+      // Process frames in batches
+      for (let i = 0; i < framesToDownload.length; i += CONCURRENCY_LIMIT) {
         if (!scrapeState.active) {
           console.log(`Scrape for session ${sessionId} was stopped`);
           break;
         }
 
-        // Use Unix timestamp (integer) as required by Frigate API
-        const timestamp = Math.floor(currentTime.toSeconds());
-        const frameNumber = String(frameCount + 1).padStart(4, '0');
-        const snapshotFile = path.join(sessionDir, `frame_${frameNumber}.jpg`);
+        const batch = framesToDownload.slice(i, i + CONCURRENCY_LIMIT);
 
-        // Define search window: +/- 5% of interval
-        const windowSize = Math.max(1, Math.floor(intervalSeconds * 0.05));
+        // Process batch in parallel
+        await Promise.all(batch.map(async (frame) => {
+          const { frameNumber, timestamp, currentTime } = frame;
+          const snapshotFile = path.join(sessionDir, `frame_${frameNumber}.jpg`);
 
-        // Spiral search: T, T+1, T-1, T+2, T-2, ... up to window limit
-        let downloaded = false;
-        let usedTimestamp = timestamp;
+          // Define search window: +/- 5% of interval
+          const windowSize = Math.max(1, Math.floor(intervalSeconds * 0.05));
 
-        for (let offset = 0; offset <= windowSize; offset++) {
-          const offsets = offset === 0 ? [0] : [offset, -offset];
+          // Spiral search: T, T+1, T-1, T+2, T-2, ... up to window limit
+          let downloaded = false;
+          let usedTimestamp = timestamp;
 
-          for (const tryOffset of offsets) {
-            const tryTimestamp = timestamp + tryOffset;
-            const tryUrl = `${frigateApiUrl}/api/${normalizedCamera}/recordings/${tryTimestamp}/snapshot.jpg`;
+          for (let offset = 0; offset <= windowSize; offset++) {
+            const offsets = offset === 0 ? [0] : [offset, -offset];
 
-            try {
-              await this.downloadSnapshot(tryUrl, snapshotFile);
+            for (const tryOffset of offsets) {
+              const tryTimestamp = timestamp + tryOffset;
+              const tryUrl = `${frigateApiUrl}/api/${normalizedCamera}/recordings/${tryTimestamp}/snapshot.jpg`;
 
-              const relativePath = `/snapshots/${sessionId}/frame_${frameNumber}.jpg`;
-              const stats = fs.statSync(snapshotFile);
+              try {
+                await this.downloadSnapshot(tryUrl, snapshotFile);
 
-              this.db.addSnapshot(sessionId, relativePath, {
-                file_size: stats.size,
-                captured_at: currentTime.toISO()
-              });
+                const relativePath = `/snapshots/${sessionId}/frame_${frameNumber}.jpg`;
+                const stats = fs.statSync(snapshotFile);
 
-              scrapeState.completedFrames++;
-              frameCount++;
+                this.db.addSnapshot(sessionId, relativePath, {
+                  file_size: stats.size,
+                  captured_at: currentTime
+                });
 
-              this.broadcast({
-                type: 'snapshot',
-                sessionId: sessionId,
-                snapshot: relativePath,
-                count: frameCount,
-                scrape: true,
-                progress: {
-                  completed: scrapeState.completedFrames,
-                  total: scrapeState.totalFrames,
-                  current: timestamp
+                scrapeState.completedFrames++;
+                completedCount++;
+
+                // Update database with progress in real-time
+                this.db.updateSession(sessionId, {
+                  progress_current: completedCount
+                });
+
+                this.broadcast({
+                  type: 'snapshot',
+                  sessionId: sessionId,
+                  snapshot: relativePath,
+                  count: completedCount,
+                  scrape: true,
+                  progress: {
+                    completed: scrapeState.completedFrames,
+                    total: scrapeState.totalFrames,
+                    current: timestamp
+                  }
+                });
+
+                if (tryOffset === 0) {
+                  console.log(`Captured frame ${frameNumber} for session ${sessionId} at ${timestamp}`);
+                } else {
+                  console.log(`Captured frame ${frameNumber} for session ${sessionId} at ${timestamp} (found at ${tryTimestamp}, offset ${tryOffset}s)`);
                 }
-              });
-
-              if (tryOffset === 0) {
-                console.log(`Captured frame ${frameNumber} for session ${sessionId} at ${timestamp}`);
-              } else {
-                console.log(`Captured frame ${frameNumber} for session ${sessionId} at ${timestamp} (found at ${tryTimestamp}, offset ${tryOffset}s)`);
-              }
-              downloaded = true;
-              usedTimestamp = tryTimestamp;
-              break;
-            } catch (error) {
-              if (offset === 0 && tryOffset === 0) {
-                console.error(`Failed to capture frame at ${timestamp}`);
-                console.error(`Failed URL: ${tryUrl}`);
-                console.error(`Error: ${error.message} - starting spiral search (window: +/-${windowSize}s)`);
+                downloaded = true;
+                usedTimestamp = tryTimestamp;
+                break;
+              } catch (error) {
+                if (offset === 0 && tryOffset === 0) {
+                  console.error(`Failed to capture frame at ${timestamp}`);
+                  console.error(`Failed URL: ${tryUrl}`);
+                  console.error(`Error: ${error.message} - starting spiral search (window: +/-${windowSize}s)`);
+                }
               }
             }
+
+            if (downloaded) break;
           }
 
-          if (downloaded) break;
-        }
+          if (!downloaded) {
+            console.error(`Skipping frame ${frameNumber} for session ${sessionId} - no valid frame found in window +/-${windowSize}s`);
+          }
+        }));
 
-        if (!downloaded) {
-          console.error(`Skipping frame ${frameNumber} for session ${sessionId} - no valid frame found in window +/-${windowSize}s`);
-        }
+        console.log(`[Scraper] Completed batch ${Math.floor(i / CONCURRENCY_LIMIT) + 1}/${Math.ceil(framesToDownload.length / CONCURRENCY_LIMIT)} (${completedCount}/${frameCount} frames)`);
       }
 
-      console.log(`[Scraper] Finished all frames. Captured ${frameCount} frames. Emitting/Triggering render for session: ${sessionId}`);
+      console.log(`[Scraper] Finished all frames. Captured ${completedCount} frames. Emitting/Triggering render for session: ${sessionId}`);
 
       // Trigger video generation after scrape is complete
-      if (frameCount > 0) {
+      if (completedCount > 0) {
         console.log(`[Scraper] Calling triggerVideoGeneration for session: ${sessionId}`);
         await this.triggerVideoGeneration(sessionId);
       }
 
       return {
         success: true,
-        framesCaptured: frameCount,
+        framesCaptured: completedCount,
         sessionId: sessionId
       };
 
@@ -279,6 +315,9 @@ class ScraperService {
   }
 
   getScrapeStatus(sessionId) {
+    // Get session from database to get progress fields
+    const session = this.db.getSession(sessionId);
+
     // Check active scrapes first
     let scrapeState = this.activeScrapes.get(sessionId);
     if (scrapeState) {
@@ -288,6 +327,8 @@ class ScraperService {
         failed: false,
         completedFrames: scrapeState.completedFrames,
         totalFrames: scrapeState.totalFrames,
+        progress_current: session?.progress_current || scrapeState.completedFrames,
+        progress_total: session?.progress_total || scrapeState.totalFrames,
         elapsedMs: Date.now() - scrapeState.startTime
       };
     }
@@ -301,6 +342,8 @@ class ScraperService {
         failed: scrapeState.failed || false,
         completedFrames: scrapeState.completedFrames,
         totalFrames: scrapeState.totalFrames,
+        progress_current: session?.progress_current || scrapeState.completedFrames,
+        progress_total: session?.progress_total || scrapeState.totalFrames,
         elapsedMs: scrapeState.completedAt - scrapeState.startTime
       };
     }

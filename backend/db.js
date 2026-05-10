@@ -56,7 +56,9 @@ class DatabaseManager {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         started_at DATETIME,
         completed_at DATETIME,
-        retention_days INTEGER DEFAULT 7
+        retention_days INTEGER DEFAULT 7,
+        progress_current INTEGER DEFAULT 0,
+        progress_total INTEGER DEFAULT 0
       )
     `);
 
