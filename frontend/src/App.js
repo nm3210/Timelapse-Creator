@@ -932,10 +932,24 @@ function App() {
         const pollStatus = setInterval(async () => {
           try {
             const statusResponse = await fetch(`${API_URL}/api/scraper/status/${data.sessionId}`);
+
+            // Handle 404 - job completed quickly and moved to completed scrapes
+            if (statusResponse.status === 404) {
+              console.log('Scraper job completed (404 - moved to completed status)');
+              setScraperStatus({ active: false, completedFrames: scraperStatus?.completedFrames || 0 });
+              clearInterval(pollStatus);
+              return;
+            }
+
             const statusData = await statusResponse.json();
-            
+
             if (statusData.success) {
               setScraperStatus(statusData.status);
+
+              // Stop polling if job is no longer active
+              if (!statusData.status.active) {
+                clearInterval(pollStatus);
+              }
             } else {
               setScraperStatus(null);
               clearInterval(pollStatus);
