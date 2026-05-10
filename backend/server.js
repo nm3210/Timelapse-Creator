@@ -1199,19 +1199,27 @@ app.post('/api/generate-timelapse', (req, res) => {
   }
 
   const extension = format === 'gif' ? 'gif' : 'mp4';
-  // Generate unique filename to support multiple timelapses per session
+  // For scraper sessions, use sessionId as filename; for others, use unique filename
   const timestamp = Date.now();
   const uniqueId = uuidv4().substring(0, 8);
-  const filename = `timelapse-${sessionId}-${timestamp}-${uniqueId}.${extension}`;
+  const isScraper = session.source_type === 'frigate_scraper';
+  const filename = isScraper ? `${sessionId}.${extension}` : `timelapse-${sessionId}-${timestamp}-${uniqueId}.${extension}`;
   const outputFile = path.join(videosDir, filename);
   const sessionDir = path.join(snapshotsDir, sessionId);
   const fileListPath = path.join(sessionDir, `filelist-${timestamp}.txt`);
 
-  const fileList = snapshots
-    .map(s => `file '${path.join(__dirname, s.file_path.replace(/^\//, ''))}'`)
-    .join('\n');
-
-  fs.writeFileSync(fileListPath, fileList);
+  let inputPath;
+  if (isScraper) {
+    // Use frame pattern for scraper sessions
+    inputPath = path.join(sessionDir, 'frame_%04d.jpg');
+  } else {
+    // Use file list for other sessions
+    const fileList = snapshots
+      .map(s => `file '${path.join(__dirname, s.file_path.replace(/^\//, ''))}'`)
+      .join('\n');
+    fs.writeFileSync(fileListPath, fileList);
+    inputPath = fileListPath;
+  }
 
   // Build resolution scale filter
   let scaleFilter = '';
@@ -1228,9 +1236,18 @@ app.post('/api/generate-timelapse', (req, res) => {
     }
   }
 
-  const command = ffmpeg()
-    .input(fileListPath)
-    .inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
+  // Set FFmpeg binary path
+  const ffmpegPath = '/usr/bin/ffmpeg';
+
+  const command = ffmpeg({ path: ffmpegPath })
+    .input(inputPath);
+
+  // Set input options based on session type
+  if (isScraper) {
+    command.inputOptions(['-hwaccel qsv', '-c:v h264_qsv', '-r', fps.toString()]);
+  } else {
+    command.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
+  }
 
   if (format === 'gif') {
     // Build GIF filter chain
@@ -1249,11 +1266,19 @@ app.post('/api/generate-timelapse', (req, res) => {
     // If using custom color palette (colors < 256), use two-pass encoding
     if (gifColors < 256) {
       const paletteFile = path.join(sessionDir, 'palette.png');
-      
+
       // First pass: generate palette
-      const paletteCommand = ffmpeg()
-        .input(fileListPath)
-        .inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()])
+      const paletteCommand = ffmpeg({ path: ffmpegPath })
+        .input(inputPath);
+
+      // Set input options based on session type
+      if (isScraper) {
+        paletteCommand.inputOptions(['-hwaccel qsv', '-c:v h264_qsv', '-r', fps.toString()]);
+      } else {
+        paletteCommand.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
+      }
+
+      paletteCommand
         .outputOptions([
           '-vf', `${filterString ? filterString + ',' : ''}palettegen=max_colors=${gifColors}`,
           '-y'
@@ -1263,10 +1288,17 @@ app.post('/api/generate-timelapse', (req, res) => {
       paletteCommand.on('end', () => {
         // Second pass: use palette with dithering
         // Create new command for second pass with both inputs
-        const finalCommand = ffmpeg()
-          .input(fileListPath)
-          .inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()])
-          .input(paletteFile);
+        const finalCommand = ffmpeg({ path: ffmpegPath })
+          .input(inputPath);
+
+        // Set input options based on session type
+        if (isScraper) {
+          finalCommand.inputOptions(['-hwaccel qsv', '-c:v h264_qsv', '-r', fps.toString()]);
+        } else {
+          finalCommand.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
+        }
+
+        finalCommand.input(paletteFile);
         
         // Build complex filter: apply scaling/fps to video, then apply palette
         let complexFilter = '';
@@ -1287,11 +1319,11 @@ app.post('/api/generate-timelapse', (req, res) => {
           .output(outputFile)
           .on('end', () => {
             // Cleanup
-            if (fs.existsSync(fileListPath)) fs.unlinkSync(fileListPath);
+            if (!isScraper && fs.existsSync(fileListPath)) fs.unlinkSync(fileListPath);
             if (fs.existsSync(paletteFile)) fs.unlinkSync(paletteFile);
-            
+
             const videoUrl = `/videos/${filename}`;
-            
+
             // Save video to database
             try {
               const stats = fs.statSync(outputFile);
@@ -1301,7 +1333,19 @@ app.post('/api/generate-timelapse', (req, res) => {
             } catch (error) {
               console.error('Error saving video to database:', error);
             }
-            
+
+            // Update session status to completed
+            db.updateSession(sessionId, {
+              active: 0,
+              completed_at: new Date().toISOString()
+            });
+
+            // Clean up snapshots folder for scraper sessions
+            if (isScraper && fs.existsSync(sessionDir)) {
+              console.log(`Cleaning up snapshots folder for session ${sessionId}`);
+              fs.rmSync(sessionDir, { recursive: true, force: true });
+            }
+
             broadcast({
               type: 'timelapse-ready',
               sessionId: sessionId,
@@ -1309,7 +1353,7 @@ app.post('/api/generate-timelapse', (req, res) => {
               format: format,
               videoId: filename
             });
-            
+
             res.json({ success: true, videoUrl: videoUrl, format: format, filename: filename });
           })
           .on('error', (err) => {
@@ -1336,18 +1380,15 @@ app.post('/api/generate-timelapse', (req, res) => {
     }
   } else {
     // MP4 output options
-    const mp4OutputOptions = [
-      '-c:v', 'h264_nvenc',
-      '-pix_fmt', 'yuv420p',
-      '-preset', 'fast',
-      '-cq', '23'
-    ];
-    
+    const mp4OutputOptions = isScraper
+      ? ['-c:v', 'h264_qsv', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-cq', '23']
+      : ['-c:v', 'h264_nvenc', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-cq', '23'];
+
     // Add scale filter if specified
     if (scaleFilter) {
       mp4OutputOptions.push('-vf', scaleFilter);
     }
-    
+
     command.outputOptions(mp4OutputOptions);
   }
 
@@ -1356,7 +1397,7 @@ app.post('/api/generate-timelapse', (req, res) => {
     command
       .output(outputFile)
       .on('end', () => {
-        if (fs.existsSync(fileListPath)) fs.unlinkSync(fileListPath);
+        if (!isScraper && fs.existsSync(fileListPath)) fs.unlinkSync(fileListPath);
         const videoUrl = `/videos/${filename}`;
 
         // Save video to database
@@ -1367,6 +1408,18 @@ app.post('/api/generate-timelapse', (req, res) => {
           });
         } catch (error) {
           console.error('Error saving video to database:', error);
+        }
+
+        // Update session status to completed
+        db.updateSession(sessionId, {
+          active: 0,
+          completed_at: new Date().toISOString()
+        });
+
+        // Clean up snapshots folder for scraper sessions
+        if (isScraper && fs.existsSync(sessionDir)) {
+          console.log(`Cleaning up snapshots folder for session ${sessionId}`);
+          fs.rmSync(sessionDir, { recursive: true, force: true });
         }
 
         broadcast({
@@ -1389,7 +1442,7 @@ app.post('/api/generate-timelapse', (req, res) => {
     command
       .output(outputFile)
       .on('end', () => {
-        if (fs.existsSync(fileListPath)) fs.unlinkSync(fileListPath);
+        if (!isScraper && fs.existsSync(fileListPath)) fs.unlinkSync(fileListPath);
         const videoUrl = `/videos/${filename}`;
 
         // Save video to database
@@ -1400,6 +1453,18 @@ app.post('/api/generate-timelapse', (req, res) => {
           });
         } catch (error) {
           console.error('Error saving video to database:', error);
+        }
+
+        // Update session status to completed
+        db.updateSession(sessionId, {
+          active: 0,
+          completed_at: new Date().toISOString()
+        });
+
+        // Clean up snapshots folder for scraper sessions
+        if (isScraper && fs.existsSync(sessionDir)) {
+          console.log(`Cleaning up snapshots folder for session ${sessionId}`);
+          fs.rmSync(sessionDir, { recursive: true, force: true });
         }
 
         broadcast({
