@@ -37,7 +37,10 @@ class ScraperService {
 
     const startTime = DateTime.fromISO(startIso, { zone: timezone });
     const endTime = DateTime.fromISO(endIso, { zone: timezone });
-    
+
+    // Normalize camera name: lowercase and replace spaces with underscores
+    const normalizedCamera = camera.toLowerCase().replace(/\s+/g, '_');
+
     let frameCount = 0;
     const scrapeState = {
       active: true,
@@ -55,18 +58,19 @@ class ScraperService {
           break;
         }
 
-        const timestamp = currentTime.toFormat('yyyy-MM-dd HH:mm:ss');
+        // Use Unix timestamp (integer) as required by Frigate API
+        const timestamp = Math.floor(currentTime.toSeconds());
         const frameNumber = String(frameCount + 1).padStart(4, '0');
         const snapshotFile = path.join(sessionDir, `frame_${frameNumber}.jpg`);
-        
-        const snapshotUrl = `${frigateApiUrl}/api/${camera}/recordings/${encodeURIComponent(timestamp)}/snapshot.jpg`;
+
+        const snapshotUrl = `${frigateApiUrl}/api/${normalizedCamera}/recordings/${timestamp}/snapshot.jpg`;
         
         try {
           await this.downloadSnapshot(snapshotUrl, snapshotFile);
-          
+
           const relativePath = `/snapshots/${sessionId}/frame_${frameNumber}.jpg`;
           const stats = fs.statSync(snapshotFile);
-          
+
           this.db.addSnapshot(sessionId, relativePath, {
             file_size: stats.size,
             captured_at: currentTime.toISO()
@@ -90,7 +94,9 @@ class ScraperService {
 
           console.log(`Captured frame ${frameNumber} for session ${sessionId} at ${timestamp}`);
         } catch (error) {
-          console.error(`Failed to capture frame at ${timestamp}:`, error.message);
+          console.error(`Failed to capture frame at ${timestamp}`);
+          console.error(`Failed URL: ${snapshotUrl}`);
+          console.error(`Error: ${error.message}`);
           // Continue with next frame even if one fails
         }
       }
@@ -160,7 +166,7 @@ class ScraperService {
           reject(error);
         });
 
-        req.setTimeout(30000, () => {
+        req.setTimeout(10000, () => {
           req.destroy();
           reject(new Error('Request timeout'));
         });
