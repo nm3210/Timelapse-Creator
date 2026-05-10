@@ -1,19 +1,18 @@
 const express = require('express');
 const cors = require('cors');
-const ffmpeg = require('fluent-ffmpeg');
-const WebSocket = require('ws');
-const fs = require('fs');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
-const sharp = require('sharp');
+const ffmpeg = require('fluent-ffmpeg');
+const { v4: uuidv4 } = require('uuid');
 const mqtt = require('mqtt');
 const cron = require('node-cron');
-const archiver = require('archiver');
+const path = require('path');
+const fs = require('fs');
 const http = require('http');
-const https = require('https');
+const WebSocket = require('ws');
+const { spawn } = require('child_process');
 const DatabaseManager = require('./db');
 const ScraperService = require('./scraperService');
+const VideoService = require('./videoService');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -29,11 +28,13 @@ app.use('/videos', express.static('videos'));
 
 const snapshotsDir = path.join(__dirname, 'snapshots');
 const videosDir = path.join(__dirname, 'videos');
+
 if (!fs.existsSync(snapshotsDir)) fs.mkdirSync(snapshotsDir, { recursive: true });
 if (!fs.existsSync(videosDir)) fs.mkdirSync(videosDir, { recursive: true });
 
 // Initialize database
 const db = new DatabaseManager();
+const videoService = new VideoService();
 
 // Keep track of active capture processes
 const activeCaptures = new Map();
@@ -504,6 +505,24 @@ const wss = new WebSocket.Server({ port: WS_PORT });
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
   ws.on('close', () => console.log('WebSocket client disconnected'));
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      console.log('[Server] Received WebSocket message:', message.type);
+
+      // Listen for scrape_complete events to automatically trigger video generation
+      if (message.type === 'scrape_complete') {
+        console.log('[Server] Received completion signal for session:', message.sessionId);
+        const sessionId = message.sessionId;
+
+        // Trigger video generation automatically
+        generateVideoForSession(sessionId);
+      }
+    } catch (error) {
+      console.error('[Server] Error parsing WebSocket message:', error);
+    }
+  });
 });
 
 function broadcast(data) {
@@ -514,8 +533,191 @@ function broadcast(data) {
   });
 }
 
-// Initialize scraper service (must be after broadcast function is defined)
-const scraperService = new ScraperService(db, snapshotsDir, broadcast);
+// Function to generate video for a scraper session (must be defined before scraperService initialization)
+async function generateVideoForSession(sessionId) {
+  console.log('[Server] Starting automatic video generation for session:', sessionId);
+
+  const session = db.getSession(sessionId);
+  if (!session) {
+    console.error('[Server] Session not found:', sessionId);
+    return;
+  }
+
+  if (session.source_type !== 'frigate_scraper') {
+    console.log('[Server] Not a scraper session, skipping auto-generation');
+    return;
+  }
+
+  const snapshots = db.getSnapshots(sessionId);
+  if (snapshots.length < 2) {
+    console.error('[Server] Insufficient snapshots for video generation');
+    return;
+  }
+
+  // Trigger video generation with default settings
+  const videoReq = {
+    sessionId: sessionId,
+    fps: 30,
+    format: 'mp4',
+    resolutionScale: 'original'
+  };
+
+  // Call the video generation logic directly
+  // We'll reuse the existing logic by simulating a request
+  console.log('[Server] Triggering FFmpeg render for session:', sessionId);
+
+  const sessionDir = path.join(snapshotsDir, sessionId);
+  const outputFile = path.join(videosDir, `${sessionId}.mp4`);
+  const inputPath = path.join(sessionDir, 'frame_%04d.jpg');
+
+  // Get codec configuration
+  const codec = videoService.getBestCodec();
+  const ffmpegPath = '/usr/bin/ffmpeg';
+
+  const args = [
+    '-vaapi_device', '/dev/dri/renderD128',
+    '-i', inputPath,
+    '-vf', 'format=nv12,hwupload',
+    '-c:v', 'h264_vaapi',
+    '-b:v', '5M',
+    '-y',
+    outputFile
+  ];
+
+  console.log('[Server] FFmpeg Path:', ffmpegPath);
+  console.log('[Server] FFmpeg Arguments:', args);
+
+  try {
+    console.log('[Server] Calling child_process.spawn()...');
+    const ffmpegProcess = spawn(ffmpegPath, args);
+
+    if (!ffmpegProcess || !ffmpegProcess.pid) {
+      console.error('[Server] FATAL: spawn() failed to return a valid process ID.');
+      throw new Error('Process not spawned');
+    }
+
+    console.log(`[Server] SUCCESS: FFmpeg spawned with PID: ${ffmpegProcess.pid}`);
+
+    ffmpegProcess.stdout.on('data', (data) => {
+      console.log(`[FFmpeg STDOUT] ${data.toString().trim()}`);
+    });
+
+    ffmpegProcess.stderr.on('data', (data) => {
+      console.log(`[FFmpeg STDERR] ${data.toString().trim()}`);
+    });
+
+    ffmpegProcess.on('error', (err) => {
+      console.error(`[FFmpeg ERROR EVENT] Failed to start subprocess:`, err);
+    });
+
+    ffmpegProcess.on('close', (code, signal) => {
+      console.log(`[FFmpeg CLOSE EVENT] Exited with code ${code} and signal ${signal}`);
+      if (code === 0) {
+        console.log(`[Server] Render complete. Updating database...`);
+
+        const videoUrl = `/videos/${sessionId}.mp4`;
+
+        try {
+          const stats = fs.statSync(outputFile);
+          db.addVideo(sessionId, videoUrl, 30, 'mp4', {
+            file_size: stats.size
+          });
+        } catch (error) {
+          console.error('Error saving video to database:', error);
+        }
+
+        db.updateSession(sessionId, {
+          active: 0,
+          completed_at: new Date().toISOString()
+        });
+
+        if (fs.existsSync(sessionDir)) {
+          console.log(`Cleaning up snapshots folder for session ${sessionId}`);
+          fs.rmSync(sessionDir, { recursive: true, force: true });
+        }
+
+        broadcast({
+          type: 'timelapse-ready',
+          sessionId: sessionId,
+          videoUrl: videoUrl,
+          format: 'mp4',
+          videoId: `${sessionId}.mp4`
+        });
+      } else {
+        console.error(`[Server] Render failed. Code: ${code}, retrying with software...`);
+
+        const softwareArgs = [
+          '-i', inputPath,
+          '-c:v', 'libx264',
+          '-pix_fmt', 'yuv420p',
+          '-preset', 'fast',
+          '-b:v', '5M',
+          '-y',
+          outputFile
+        ];
+
+        console.log('[Server] Starting software fallback with args:', softwareArgs);
+        const fallbackProcess = spawn(ffmpegPath, softwareArgs);
+
+        fallbackProcess.stdout.on('data', (data) => {
+          console.log(`[FFmpeg FALLBACK STDOUT] ${data.toString().trim()}`);
+        });
+
+        fallbackProcess.stderr.on('data', (data) => {
+          console.log(`[FFmpeg FALLBACK STDERR] ${data.toString().trim()}`);
+        });
+
+        fallbackProcess.on('error', (fallbackErr) => {
+          console.error(`[FFmpeg FALLBACK ERROR EVENT]:`, fallbackErr);
+        });
+
+        fallbackProcess.on('close', (fallbackCode, fallbackSignal) => {
+          console.log(`[FFmpeg FALLBACK CLOSE EVENT] Exited with code ${fallbackCode} and signal ${fallbackSignal}`);
+          if (fallbackCode === 0) {
+            console.log(`[Server] Fallback render complete. Updating database...`);
+
+            const videoUrl = `/videos/${sessionId}.mp4`;
+
+            try {
+              const stats = fs.statSync(outputFile);
+              db.addVideo(sessionId, videoUrl, 30, 'mp4', {
+                file_size: stats.size
+              });
+            } catch (error) {
+              console.error('Error saving video to database:', error);
+            }
+
+            db.updateSession(sessionId, {
+              active: 0,
+              completed_at: new Date().toISOString()
+            });
+
+            if (fs.existsSync(sessionDir)) {
+              console.log(`Cleaning up snapshots folder for session ${sessionId}`);
+              fs.rmSync(sessionDir, { recursive: true, force: true });
+            }
+
+            broadcast({
+              type: 'timelapse-ready',
+              sessionId: sessionId,
+              videoUrl: videoUrl,
+              format: 'mp4',
+              videoId: `${sessionId}.mp4`
+            });
+          } else {
+            console.error(`[Server] Fallback render also failed. Code: ${fallbackCode}`);
+          }
+        });
+      }
+    });
+
+  } catch (err) {
+    console.error(`[Server] SYNCHRONOUS CRASH:`, err);
+  }
+}
+
+// Initialize scraper service (must be after broadcast and generateVideoForSession functions are defined)
+const scraperService = new ScraperService(db, snapshotsDir, broadcast, generateVideoForSession);
 
 // Helper function to replace localhost addresses in RTSP URLs
 function replaceRtspHost(rtspUrl) {
@@ -1239,14 +1441,24 @@ app.post('/api/generate-timelapse', (req, res) => {
   // Set FFmpeg binary path
   const ffmpegPath = '/usr/bin/ffmpeg';
 
+  // For scraper sessions, implement dynamic fallback: try hardware first, fallback to software
+  let codec;
+  let useFallback = false;
+  if (isScraper) {
+    codec = videoService.getBestCodec();
+  } else {
+    // Use CUDA for non-scraper sessions (existing behavior)
+    codec = videoService.getCudaCodec();
+  }
+
   const command = ffmpeg({ path: ffmpegPath })
     .input(inputPath);
 
-  // Set input options based on session type
+  // Set input options based on session type and codec availability
   if (isScraper) {
-    command.inputOptions(['-hwaccel qsv', '-qsv_device', '/dev/dri/renderD128', '-c:v h264_qsv', '-r', fps.toString()]);
+    command.inputOptions([...codec.inputOptions, '-r', fps.toString()]);
   } else {
-    command.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
+    command.inputOptions([...codec.inputOptions, '-r', fps.toString()]);
   }
 
   if (format === 'gif') {
@@ -1271,10 +1483,12 @@ app.post('/api/generate-timelapse', (req, res) => {
       const paletteCommand = ffmpeg({ path: ffmpegPath })
         .input(inputPath);
 
-      // Set input options based on session type
+      // Set input options based on session type and codec availability
       if (isScraper) {
-        paletteCommand.inputOptions(['-hwaccel qsv', '-qsv_device', '/dev/dri/renderD128', '-c:v h264_qsv', '-r', fps.toString()]);
+        // Use codec tiering for scraper sessions
+        paletteCommand.inputOptions([...codec.inputOptions, '-r', fps.toString()]);
       } else {
+        // Use CUDA for non-scraper sessions (existing behavior)
         paletteCommand.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
       }
 
@@ -1291,10 +1505,12 @@ app.post('/api/generate-timelapse', (req, res) => {
         const finalCommand = ffmpeg({ path: ffmpegPath })
           .input(inputPath);
 
-        // Set input options based on session type
+        // Set input options based on session type and codec availability
         if (isScraper) {
-          finalCommand.inputOptions(['-hwaccel qsv', '-qsv_device', '/dev/dri/renderD128', '-c:v h264_qsv', '-r', fps.toString()]);
+          // Use codec tiering for scraper sessions
+          finalCommand.inputOptions([...codec.inputOptions, '-r', fps.toString()]);
         } else {
+          // Use CUDA for non-scraper sessions (existing behavior)
           finalCommand.inputOptions(['-hwaccel cuda', '-f concat', '-safe 0', '-r', fps.toString()]);
         }
 
@@ -1380,12 +1596,17 @@ app.post('/api/generate-timelapse', (req, res) => {
     }
   } else {
     // MP4 output options
-    const mp4OutputOptions = isScraper
-      ? ['-c:v', 'h264_qsv', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-b:v', '5M']
-      : ['-c:v', 'h264_nvenc', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-cq', '23'];
+    let mp4OutputOptions;
+    if (isScraper) {
+      // Use codec tiering for scraper sessions
+      mp4OutputOptions = codec.outputOptions;
+    } else {
+      // Use CUDA for non-scraper sessions (existing behavior)
+      mp4OutputOptions = ['-c:v', 'h264_nvenc', '-pix_fmt', 'yuv420p', '-preset', 'fast', '-cq', '23'];
+    }
 
-    // Add scale filter if specified
-    if (scaleFilter) {
+    // Add scale filter if specified (for non-VAAPI codecs)
+    if (scaleFilter && codec.type !== 'hardware') {
       mp4OutputOptions.push('-vf', scaleFilter);
     }
 
@@ -1438,50 +1659,216 @@ app.post('/api/generate-timelapse', (req, res) => {
       })
       .run();
   } else if (format === 'mp4') {
-    // MP4 encoding
-    command
-      .output(outputFile)
-      .on('end', () => {
-        if (!isScraper && fs.existsSync(fileListPath)) fs.unlinkSync(fileListPath);
-        const videoUrl = `/videos/${filename}`;
+    // MP4 encoding with direct spawn for VAAPI, fluent-ffmpeg for others
+    if (isScraper && codec.type === 'hardware') {
+      // Use direct spawn for VAAPI with exact arguments and hyper-verbose debugging
+      console.log('[VideoService] 1. Preparing FFmpeg arguments...');
+      const ffmpegPath = '/usr/bin/ffmpeg';
 
-        // Save video to database
-        try {
-          const stats = fs.statSync(outputFile);
-          db.addVideo(sessionId, videoUrl, parseInt(fps), format, {
-            file_size: stats.size
+      const args = [
+        '-vaapi_device', '/dev/dri/renderD128',
+        '-i', inputPath,
+        '-vf', 'format=nv12,hwupload',
+        '-c:v', 'h264_vaapi',
+        '-b:v', '5M',
+        '-y',
+        outputFile
+      ];
+
+      console.log(`[VideoService] 2. FFmpeg Path: ${ffmpegPath}`);
+      console.log(`[VideoService] 3. FFmpeg Arguments array:`, args);
+
+      try {
+        console.log('[VideoService] 4. Calling child_process.spawn() ...');
+        const ffmpegProcess = spawn(ffmpegPath, args);
+
+        if (!ffmpegProcess || !ffmpegProcess.pid) {
+          console.error('[VideoService] FATAL: spawn() failed to return a valid process ID.');
+          throw new Error('Process not spawned');
+        }
+
+        console.log(`[VideoService] 5. SUCCESS: FFmpeg spawned with PID: ${ffmpegProcess.pid}`);
+
+        ffmpegProcess.stdout.on('data', (data) => {
+          console.log(`[FFmpeg STDOUT] ${data.toString().trim()}`);
+        });
+
+        ffmpegProcess.stderr.on('data', (data) => {
+          console.log(`[FFmpeg STDERR] ${data.toString().trim()}`);
+        });
+
+        ffmpegProcess.on('error', (err) => {
+          console.error(`[FFmpeg ERROR EVENT] Failed to start subprocess:`, err);
+          res.status(500).json({ success: false, message: `FFmpeg failed to start: ${err.message}` });
+        });
+
+        ffmpegProcess.on('close', (code, signal) => {
+          console.log(`[FFmpeg CLOSE EVENT] Exited with code ${code} and signal ${signal}`);
+          if (code === 0) {
+            console.log(`[VideoService] 6. Render complete. Updating database...`);
+
+            const videoUrl = `/videos/${filename}`;
+
+            // Save video to database
+            try {
+              const stats = fs.statSync(outputFile);
+              db.addVideo(sessionId, videoUrl, parseInt(fps), format, {
+                file_size: stats.size
+              });
+            } catch (error) {
+              console.error('Error saving video to database:', error);
+            }
+
+            // Update session status to completed
+            db.updateSession(sessionId, {
+              active: 0,
+              completed_at: new Date().toISOString()
+            });
+
+            // Clean up snapshots folder for scraper sessions
+            if (fs.existsSync(sessionDir)) {
+              console.log(`Cleaning up snapshots folder for session ${sessionId}`);
+              fs.rmSync(sessionDir, { recursive: true, force: true });
+            }
+
+            broadcast({
+              type: 'timelapse-ready',
+              sessionId: sessionId,
+              videoUrl: videoUrl,
+              format: format,
+              videoId: filename
+            });
+
+            res.json({ success: true, videoUrl: videoUrl, format: format, filename: filename });
+          } else {
+            console.error(`[VideoService] 6. Render failed. Code: ${code}, retrying with software...`);
+
+            // Retry with software fallback
+            const softwareArgs = [
+              '-i', inputPath,
+              '-c:v', 'libx264',
+              '-pix_fmt', 'yuv420p',
+              '-preset', 'fast',
+              '-b:v', '5M',
+              '-y',
+              outputFile
+            ];
+
+            console.log('[VideoService] 7. Starting software fallback with args:', softwareArgs);
+            const fallbackProcess = spawn(ffmpegPath, softwareArgs);
+
+            console.log('[VideoService] 8. Calling child_process.spawn() for fallback...');
+            if (!fallbackProcess || !fallbackProcess.pid) {
+              console.error('[VideoService] FATAL: Fallback spawn() failed to return a valid process ID.');
+              res.status(500).json({ success: false, message: 'Fallback process not spawned' });
+              return;
+            }
+
+            console.log(`[VideoService] 9. SUCCESS: Fallback FFmpeg spawned with PID: ${fallbackProcess.pid}`);
+
+            fallbackProcess.stdout.on('data', (data) => {
+              console.log(`[FFmpeg FALLBACK STDOUT] ${data.toString().trim()}`);
+            });
+
+            fallbackProcess.stderr.on('data', (data) => {
+              console.log(`[FFmpeg FALLBACK STDERR] ${data.toString().trim()}`);
+            });
+
+            fallbackProcess.on('error', (fallbackErr) => {
+              console.error(`[FFmpeg FALLBACK ERROR EVENT] Failed to start subprocess:`, fallbackErr);
+              res.status(500).json({ success: false, message: `Fallback FFmpeg failed to start: ${fallbackErr.message}` });
+            });
+
+            fallbackProcess.on('close', (fallbackCode, fallbackSignal) => {
+              console.log(`[FFmpeg FALLBACK CLOSE EVENT] Exited with code ${fallbackCode} and signal ${fallbackSignal}`);
+              if (fallbackCode === 0) {
+                console.log(`[VideoService] 10. Fallback render complete. Updating database...`);
+
+                const videoUrl = `/videos/${filename}`;
+
+                try {
+                  const stats = fs.statSync(outputFile);
+                  db.addVideo(sessionId, videoUrl, parseInt(fps), format, {
+                    file_size: stats.size
+                  });
+                } catch (error) {
+                  console.error('Error saving video to database:', error);
+                }
+
+                db.updateSession(sessionId, {
+                  active: 0,
+                  completed_at: new Date().toISOString()
+                });
+
+                if (fs.existsSync(sessionDir)) {
+                  console.log(`Cleaning up snapshots folder for session ${sessionId}`);
+                  fs.rmSync(sessionDir, { recursive: true, force: true });
+                }
+
+                broadcast({
+                  type: 'timelapse-ready',
+                  sessionId: sessionId,
+                  videoUrl: videoUrl,
+                  format: format,
+                  videoId: filename
+                });
+
+                res.json({ success: true, videoUrl: videoUrl, format: format, filename: filename });
+              } else {
+                console.error(`[VideoService] 10. Fallback render also failed. Code: ${fallbackCode}`);
+                res.status(500).json({ success: false, message: `Video encoding failed with code ${fallbackCode}` });
+              }
+            });
+          }
+        });
+
+      } catch (err) {
+        console.error(`[VideoService] SYNCHRONOUS CRASH:`, err);
+        res.status(500).json({ success: false, message: `Synchronous error during FFmpeg spawn: ${err.message}` });
+      }
+    } else {
+      // Use fluent-ffmpeg for non-scraper sessions or software encoding
+      command
+        .output(outputFile)
+        .on('end', () => {
+          if (!isScraper && fs.existsSync(fileListPath)) fs.unlinkSync(fileListPath);
+          const videoUrl = `/videos/${filename}`;
+
+          try {
+            const stats = fs.statSync(outputFile);
+            db.addVideo(sessionId, videoUrl, parseInt(fps), format, {
+              file_size: stats.size
+            });
+          } catch (error) {
+            console.error('Error saving video to database:', error);
+          }
+
+          db.updateSession(sessionId, {
+            active: 0,
+            completed_at: new Date().toISOString()
           });
-        } catch (error) {
-          console.error('Error saving video to database:', error);
-        }
 
-        // Update session status to completed
-        db.updateSession(sessionId, {
-          active: 0,
-          completed_at: new Date().toISOString()
-        });
+          if (isScraper && fs.existsSync(sessionDir)) {
+            console.log(`Cleaning up snapshots folder for session ${sessionId}`);
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+          }
 
-        // Clean up snapshots folder for scraper sessions
-        if (isScraper && fs.existsSync(sessionDir)) {
-          console.log(`Cleaning up snapshots folder for session ${sessionId}`);
-          fs.rmSync(sessionDir, { recursive: true, force: true });
-        }
+          broadcast({
+            type: 'timelapse-ready',
+            sessionId: sessionId,
+            videoUrl: videoUrl,
+            format: format,
+            videoId: filename
+          });
 
-        broadcast({
-          type: 'timelapse-ready',
-          sessionId: sessionId,
-          videoUrl: videoUrl,
-          format: format,
-          videoId: filename
-        });
-
-        res.json({ success: true, videoUrl: videoUrl, format: format, filename: filename });
-      })
-      .on('error', (err) => {
-        console.error('Error generating timelapse:', err);
-        res.status(500).json({ success: false, message: err.message });
-      })
-      .run();
+          res.json({ success: true, videoUrl: videoUrl, format: format, filename: filename });
+        })
+        .on('error', (err) => {
+          console.error('Error generating timelapse:', err);
+          res.status(500).json({ success: false, message: err.message });
+        })
+        .run();
+    }
   }
 });
 

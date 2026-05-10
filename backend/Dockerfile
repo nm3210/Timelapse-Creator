@@ -1,15 +1,21 @@
 FROM node:18-slim
 
-# Install FFmpeg and required dependencies
-RUN apt-get update && apt-get install -y \
+# Tell the system to use the modern Intel iHD driver
+ENV LIBVA_DRIVER_NAME=iHD
+
+WORKDIR /app
+
+# Install standard open-source drivers and FFmpeg directly from main
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    intel-media-va-driver \
+    libmfx1 \
+    va-driver-all \
     python3 \
     make \
     g++ \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir /mnt/photo_import
-
-WORKDIR /app
+    && mkdir -p /mnt/photo_import
 
 # Copy package files
 COPY package*.json ./

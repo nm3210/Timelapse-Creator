@@ -5,10 +5,11 @@ const http = require('http');
 const https = require('https');
 
 class ScraperService {
-  constructor(db, snapshotsDir, broadcastCallback) {
+  constructor(db, snapshotsDir, broadcast, videoGeneratorCallback) {
     this.db = db;
     this.snapshotsDir = snapshotsDir;
-    this.broadcast = broadcastCallback;
+    this.broadcast = broadcast;
+    this.videoGeneratorCallback = videoGeneratorCallback;
     this.activeScrapes = new Map();
     this.completedScrapes = new Map(); // Keep last 10 completed/failed sessions
   }
@@ -130,10 +131,11 @@ class ScraperService {
         }
       }
 
-      console.log(`Scrape completed for session ${sessionId}. Captured ${frameCount} frames.`);
+      console.log(`[Scraper] Finished all frames. Captured ${frameCount} frames. Emitting/Triggering render for session: ${sessionId}`);
 
       // Trigger video generation after scrape is complete
       if (frameCount > 0) {
+        console.log(`[Scraper] Calling triggerVideoGeneration for session: ${sessionId}`);
         await this.triggerVideoGeneration(sessionId);
       }
 
@@ -244,16 +246,26 @@ class ScraperService {
   }
 
   async triggerVideoGeneration(sessionId) {
-    console.log(`Triggering video generation for scraped session ${sessionId}`);
-    console.log(`FFmpeg video rendering will start shortly for session ${sessionId}...`);
+    console.log(`[Scraper] Triggering video generation for scraped session ${sessionId}`);
+    console.log(`[Scraper] FFmpeg video rendering will start shortly for session ${sessionId}...`);
 
-    // This will be handled by the existing video generation logic in server.js
-    // We just need to notify that scraping is complete
-    this.broadcast({
-      type: 'scrape_complete',
-      sessionId: sessionId,
-      message: 'Scraping completed, ready for video generation'
-    });
+    // Call the video generation callback if available
+    if (this.videoGeneratorCallback) {
+      console.log(`[Scraper] Calling video generation callback for session: ${sessionId}`);
+      try {
+        await this.videoGeneratorCallback(sessionId);
+      } catch (error) {
+        console.error(`[Scraper] Error calling video generation callback:`, error);
+      }
+    } else {
+      console.warn(`[Scraper] No video generation callback available, broadcasting instead`);
+      // Fallback to broadcast for backward compatibility
+      this.broadcast({
+        type: 'scrape_complete',
+        sessionId: sessionId,
+        message: 'Scraping completed, ready for video generation'
+      });
+    }
   }
 
   stopScrape(sessionId) {
