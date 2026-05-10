@@ -936,7 +936,7 @@ function App() {
             // Handle 404 - job completed quickly and moved to completed scrapes
             if (statusResponse.status === 404) {
               console.log('Scraper job completed (404 - moved to completed status)');
-              setScraperStatus({ active: false, completedFrames: scraperStatus?.completedFrames || 0 });
+              setScraperStatus({ active: false, completed: true, completedFrames: scraperStatus?.completedFrames || 0 });
               clearInterval(pollStatus);
               return;
             }
@@ -946,8 +946,9 @@ function App() {
             if (statusData.success) {
               setScraperStatus(statusData.status);
 
-              // Stop polling if job is no longer active
-              if (!statusData.status.active) {
+              // Stop polling if job is completed or no longer active
+              if (statusData.status.completed || !statusData.status.active) {
+                console.log('Scraper job completed');
                 clearInterval(pollStatus);
               }
             } else {

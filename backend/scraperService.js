@@ -131,7 +131,7 @@ class ScraperService {
       }
 
       console.log(`Scrape completed for session ${sessionId}. Captured ${frameCount} frames.`);
-      
+
       // Trigger video generation after scrape is complete
       if (frameCount > 0) {
         await this.triggerVideoGeneration(sessionId);
@@ -143,9 +143,31 @@ class ScraperService {
         sessionId: sessionId
       };
 
+    } catch (error) {
+      console.error(`Scrape failed for session ${sessionId}:`, error.message);
+
+      // Mark as failed in completed scrapes
+      this.completedScrapes.set(sessionId, {
+        ...scrapeState,
+        active: false,
+        completed: false,
+        failed: true,
+        completedAt: Date.now()
+      });
+
+      throw error;
+
     } finally {
-      // Move to completed scrapes and keep last 10
-      this.completedScrapes.set(sessionId, { ...scrapeState, active: false, completedAt: Date.now() });
+      // Only move to completed scrapes if not already set by catch block
+      if (!this.completedScrapes.has(sessionId)) {
+        this.completedScrapes.set(sessionId, {
+          ...scrapeState,
+          active: false,
+          completed: true,
+          failed: false,
+          completedAt: Date.now()
+        });
+      }
 
       // Keep only last 10 completed sessions
       if (this.completedScrapes.size > 10) {
@@ -250,6 +272,8 @@ class ScraperService {
     if (scrapeState) {
       return {
         active: scrapeState.active,
+        completed: false,
+        failed: false,
         completedFrames: scrapeState.completedFrames,
         totalFrames: scrapeState.totalFrames,
         elapsedMs: Date.now() - scrapeState.startTime
@@ -261,6 +285,8 @@ class ScraperService {
     if (scrapeState) {
       return {
         active: false,
+        completed: scrapeState.completed || false,
+        failed: scrapeState.failed || false,
         completedFrames: scrapeState.completedFrames,
         totalFrames: scrapeState.totalFrames,
         elapsedMs: scrapeState.completedAt - scrapeState.startTime
