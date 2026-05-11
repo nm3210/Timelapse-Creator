@@ -121,9 +121,10 @@ class ScraperService {
                 scrapeState.completedFrames++;
                 completedCount++;
 
-                // Update database with progress in real-time
+                // Update database with progress in real-time using atomic frame number
+                // Use the frame number (1-based index) to avoid race conditions from concurrent updates
                 this.db.updateSession(sessionId, {
-                  progress_current: completedCount
+                  progress_current: parseInt(frameNumber)
                 });
 
                 this.broadcast({
@@ -309,6 +310,13 @@ class ScraperService {
     if (scrapeState) {
       scrapeState.active = false;
       console.log(`Stopping scrape for session ${sessionId}`);
+
+      // Update database to mark session as cancelled
+      this.db.updateSession(sessionId, {
+        active: 0,
+        completed_at: new Date().toISOString()
+      });
+
       return true;
     }
     return false;
@@ -344,7 +352,8 @@ class ScraperService {
         totalFrames: scrapeState.totalFrames,
         progress_current: session?.progress_current || scrapeState.completedFrames,
         progress_total: session?.progress_total || scrapeState.totalFrames,
-        elapsedMs: scrapeState.completedAt - scrapeState.startTime
+        elapsedMs: scrapeState.completedAt - scrapeState.startTime,
+        videoUrl: scrapeState.completed ? `/output/${sessionId}.mp4` : null
       };
     }
 

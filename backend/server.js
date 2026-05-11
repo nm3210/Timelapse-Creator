@@ -25,6 +25,7 @@ app.use(cors());
 app.use(express.json());
 app.use('/snapshots', express.static('snapshots'));
 app.use('/videos', express.static('videos'));
+app.use('/output', express.static('videos'));
 
 const snapshotsDir = path.join(__dirname, 'snapshots');
 const videosDir = path.join(__dirname, 'videos');
@@ -706,6 +707,12 @@ async function generateVideoForSession(sessionId) {
             });
           } else {
             console.error(`[Server] Fallback render also failed. Code: ${fallbackCode}`);
+            // Broadcast render failure to frontend
+            broadcast({
+              type: 'render-failed',
+              sessionId: sessionId,
+              message: 'Video rendering failed after both hardware and software attempts'
+            });
           }
         });
       }

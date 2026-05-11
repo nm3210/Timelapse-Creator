@@ -109,6 +109,8 @@ function App() {
   const [scraperLoading, setScraperLoading] = useState(false);
   const [scraperSessionId, setScraperSessionId] = useState(null);
   const [scraperStatus, setScraperStatus] = useState(null);
+  const [scraperVideoUrl, setScraperVideoUrl] = useState(null);
+  const [scraperCompleted, setScraperCompleted] = useState(false);
 
   // MQTT source selection
   const [mqttHttpUrl, setMqttHttpUrl] = useState('');
@@ -162,6 +164,15 @@ function App() {
           // Reload videos for this session if we're viewing it in sessions management
           if (expandedSessionId === data.sessionId) {
             loadSessionVideos(data.sessionId);
+          }
+          break;
+        case 'render-failed':
+          if (data.sessionId === sessionId || data.sessionId === scraperSessionId) {
+            alert(`Render failed: ${data.message}`);
+            setScraperStatus(null);
+            setScraperLoading(false);
+            setScraperCompleted(false);
+            setScraperVideoUrl(null);
           }
           break;
         case 'error':
@@ -908,6 +919,12 @@ function App() {
       return;
     }
 
+    // Reset state for new scrape (complete state wipe)
+    setScraperSessionId(null);
+    setScraperCompleted(false);
+    setScraperVideoUrl(null);
+    setScraperStatus(null);
+
     setScraperLoading(true);
     try {
       const response = await fetch(`${API_URL}/api/scraper/start`, {
@@ -927,7 +944,7 @@ function App() {
       if (data.success) {
         setScraperSessionId(data.sessionId);
         alert('Scraping started successfully');
-        
+
         // Start polling for status
         const pollStatus = setInterval(async () => {
           try {
@@ -937,6 +954,8 @@ function App() {
             if (statusResponse.status === 404) {
               console.log('Scraper job completed (404 - moved to completed status)');
               setScraperStatus({ active: false, completed: true, completedFrames: scraperStatus?.completedFrames || 0 });
+              setScraperCompleted(true);
+              setScraperVideoUrl(`${API_URL}/videos/${data.sessionId}.mp4`);
               clearInterval(pollStatus);
               return;
             }
@@ -949,14 +968,20 @@ function App() {
               // Stop polling if job is completed or no longer active
               if (statusData.status.completed || !statusData.status.active) {
                 console.log('Scraper job completed');
+                setScraperCompleted(true);
+                setScraperVideoUrl(statusData.status.videoUrl || `${API_URL}/videos/${data.sessionId}.mp4`);
                 clearInterval(pollStatus);
               }
             } else {
               setScraperStatus(null);
+              setScraperCompleted(true);
+              setScraperVideoUrl(`${API_URL}/videos/${data.sessionId}.mp4`);
               clearInterval(pollStatus);
             }
           } catch (error) {
             console.error('Error polling scraper status:', error);
+            setScraperStatus(null);
+            setScraperLoading(false);
             clearInterval(pollStatus);
           }
         }, 2000);
@@ -984,6 +1009,8 @@ function App() {
       if (data.success) {
         setScraperSessionId(null);
         setScraperStatus(null);
+        setScraperCompleted(false);
+        setScraperVideoUrl(null);
         alert('Scraping stopped successfully');
       } else {
         alert('Failed to stop scraper: ' + data.message);
@@ -991,6 +1018,13 @@ function App() {
     } catch (error) {
       alert('Error stopping scraper: ' + error.message);
     }
+  };
+
+  const clearScraperSession = () => {
+    setScraperSessionId(null);
+    setScraperStatus(null);
+    setScraperCompleted(false);
+    setScraperVideoUrl(null);
   };
 
   // Load sessions and stats when sessions tab is selected
@@ -2528,12 +2562,12 @@ function App() {
                 <div className="flex gap-4">
                   <button
                     onClick={startScraper}
-                    disabled={!selectedScraperCamera || !scraperStartIso || !scraperEndIso || !scraperInterval || scraperLoading || scraperSessionId}
+                    disabled={!selectedScraperCamera || !scraperStartIso || !scraperEndIso || !scraperInterval || scraperLoading || (scraperSessionId && !scraperCompleted)}
                     className="px-6 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded-lg"
                   >
-                    {scraperLoading ? 'Starting...' : scraperSessionId ? 'Scraping...' : 'Start Scraping'}
+                    {scraperLoading ? 'Starting...' : scraperSessionId && !scraperCompleted ? 'Scraping...' : 'Start Scraping'}
                   </button>
-                  {scraperSessionId && (
+                  {scraperSessionId && !scraperCompleted && (
                     <button
                       onClick={stopScraper}
                       className="px-6 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg"
@@ -2541,10 +2575,18 @@ function App() {
                       Stop Scraping
                     </button>
                   )}
+                  {scraperCompleted && (
+                    <button
+                      onClick={clearScraperSession}
+                      className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg"
+                    >
+                      New Scrape
+                    </button>
+                  )}
                 </div>
 
                 {/* Status Display */}
-                {scraperStatus && (
+                {scraperStatus && !scraperCompleted && (
                   <div className="bg-green-900/30 border border-green-700 rounded-lg p-4">
                     <h3 className="text-white font-semibold mb-2">
                       {scraperStatus.active && !scraperStatus.completed
@@ -2571,6 +2613,24 @@ function App() {
                           </p>
                         </div>
                       )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Video Player Display */}
+                {scraperCompleted && scraperVideoUrl && (
+                  <div className="bg-purple-900/30 border border-purple-700 rounded-lg p-4">
+                    <h3 className="text-white font-semibold mb-2">Video Ready</h3>
+                    <div className="text-sm text-gray-200 space-y-2">
+                      <p>Your timelapse video has been generated successfully!</p>
+                      <video
+                        src={scraperVideoUrl}
+                        controls
+                        autoPlay
+                        loop
+                        className="w-full max-w-full rounded-lg"
+                        style={{ maxHeight: '500px' }}
+                      />
                     </div>
                   </div>
                 )}
