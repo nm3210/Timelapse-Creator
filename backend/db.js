@@ -105,21 +105,25 @@ class DatabaseManager {
     // Get current database version
     const versionResult = this.db.prepare('SELECT value FROM settings WHERE key = ?').get('db_version');
     const currentVersion = versionResult ? parseInt(versionResult.value) : 0;
-    
+
     // Run migrations if needed
     if (currentVersion < 1) {
       this.migrateToV1();
     }
-    
+
     if (currentVersion < 2) {
       this.migrateToV2();
     }
-    
+
+    if (currentVersion < 3) {
+      this.migrateToV3();
+    }
+
     // Update version
     this.db.prepare(`
-      INSERT OR REPLACE INTO settings (key, value) 
+      INSERT OR REPLACE INTO settings (key, value)
       VALUES ('db_version', ?)
-    `).run('2');
+    `).run('3');
   }
 
   migrateToV1() {
@@ -209,6 +213,48 @@ class DatabaseManager {
       // Rollback on error
       this.db.exec('ROLLBACK');
       console.error('Migration to version 2 failed:', error.message);
+      throw error;
+    }
+  }
+
+  migrateToV3() {
+    // Migration to add progress_current and progress_total columns to sessions table
+    console.log('Running migration to add progress tracking columns...');
+
+    try {
+      // Check if columns already exist
+      const tableInfo = this.db.prepare("PRAGMA table_info(sessions)").all();
+      const hasProgressCurrent = tableInfo.some(col => col.name === 'progress_current');
+      const hasProgressTotal = tableInfo.some(col => col.name === 'progress_total');
+
+      if (hasProgressCurrent && hasProgressTotal) {
+        console.log('Progress columns already exist, skipping migration');
+        return;
+      }
+
+      // Begin transaction
+      this.db.exec('BEGIN TRANSACTION');
+
+      // Add progress_current column if it doesn't exist
+      if (!hasProgressCurrent) {
+        this.db.exec('ALTER TABLE sessions ADD COLUMN progress_current INTEGER DEFAULT 0');
+        console.log('Added progress_current column');
+      }
+
+      // Add progress_total column if it doesn't exist
+      if (!hasProgressTotal) {
+        this.db.exec('ALTER TABLE sessions ADD COLUMN progress_total INTEGER DEFAULT 0');
+        console.log('Added progress_total column');
+      }
+
+      // Commit transaction
+      this.db.exec('COMMIT');
+
+      console.log('Database migrated to version 3 (added progress tracking columns)');
+    } catch (error) {
+      // Rollback on error
+      this.db.exec('ROLLBACK');
+      console.error('Migration to version 3 failed:', error.message);
       throw error;
     }
   }
